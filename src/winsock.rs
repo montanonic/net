@@ -6,11 +6,9 @@ use std::marker;
 use std::mem::MaybeUninit;
 use std::{mem, ptr};
 use winapi::ctypes::c_int;
-use winapi::shared::ws2def::{
-    ADDRINFOA, AF_INET, AF_INET6, AI_PASSIVE, IPPROTO_ICMP, IPPROTO_IP, PADDRINFOA, SOCK_RAW,
-};
+use winapi::shared::ws2def::{self, ADDRINFOA, PADDRINFOA};
 use winapi::um::winsock2::{
-    self, WSACleanup, WSAGetLastError, WSAStartup, INVALID_SOCKET, SOCKET, WSADATA, WSAEACCES,
+    self, WSACleanup, WSAGetLastError, WSAStartup, SOCKET, WSADATA, WSAEACCES,
 };
 use winapi::um::ws2tcpip;
 
@@ -26,13 +24,10 @@ pub fn initialize_winsock() {
 
     // Then we create a socket.
     let socket = Socket::create();
-
-    // Get address info for it:
-    let mut addr_info = socket::get_addr_info("localhost", "", &socket);
-
-    for info in addr_info.iter_mut() {
-        info;
-    }
+    // And bind it.
+    socket.bind("", "7878");
+    // And then listen.
+    socket.listen();
 }
 
 mod socket {
@@ -61,12 +56,12 @@ mod socket {
     impl Socket {
         /// Creates a Raw Socket over IPv4 and via the ICMP protocol.
         pub fn create() -> Self {
-            let address_family = AF_INET; // IPv4
-            let socket_type = SOCK_RAW;
-            let protocol = IPPROTO_ICMP as i32;
+            let address_family = ws2def::AF_INET; // IPv4
+            let socket_type = ws2def::SOCK_RAW;
+            let protocol = ws2def::IPPROTO_ICMP as i32;
 
             match unsafe { winsock2::socket(address_family, socket_type, protocol) } {
-                INVALID_SOCKET => {
+                winsock2::INVALID_SOCKET => {
                     let err_code = unsafe { WSAGetLastError() };
                     let err_msg = match err_code {
                         WSAEACCES => "Permission denied. \
@@ -88,6 +83,37 @@ mod socket {
             }
         }
 
+        pub fn bind(&self, host_name: &str, service_or_port: &str) {
+            // Get address info for the socket. Note that the official API usage
+            // suggests creating the socket via addrinfo, and not the other way
+            // around which is what I do here. IMO, their API is clunky AF.
+            let addr_info = get_addr_info(host_name, service_or_port, self);
+
+            let code = unsafe {
+                winsock2::bind(self.handle, addr_info.ai_addr, addr_info.ai_addrlen as i32)
+            };
+            if code != 0 {
+                panic!(format!("socket bind failed with error code: {}", code));
+            }
+            // "Once the bind function is called, the address information
+            // returned by the getaddrinfo function is no longer needed. The
+            // freeaddrinfo function is called to free the memory allocated by
+            // the getaddrinfo function for this address information." Because
+            // of the AddrInfo drop implementation, this happens as it exits the
+            // scope.
+        }
+
+        pub fn listen(&self) {
+            let code = unsafe { winsock2::listen(self.handle, winsock2::SOMAXCONN) };
+            if code != 0 {
+                panic!(format!(
+                    "listening to socket failed with code: {}. Last winsock error code: {}",
+                    code,
+                    unsafe { WSAGetLastError() }
+                ));
+            }
+        }
+
         pub fn get_handle(&self) -> SOCKET {
             self.handle
         }
@@ -100,23 +126,7 @@ mod socket {
         }
     }
 
-    #[derive(Debug)]
     pub struct AddrInfo(PADDRINFOA);
-
-    // impl fmt::Debug for AddrInfo {
-    //     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-    //         let s = self.0;
-    //         f.debug_struct("AddrInfo")
-    //             .field("ai_flags", &s.ai_flags)
-    //             .field("ai_family", &s.ai_family)
-    //             .field("ai_socktype", &s.ai_socktype)
-    //             .field("ai_protocol", &s.ai_protocol)
-    //             .field("ai_addrlen", &s.ai_addrlen)
-    //             .field("ai_canonname", &s.ai_canonname)
-    //             .field("ai_addr", &s.ai_addr)
-    //             .field("ai_next", &s.ai_next)
-    //     }
-    // }
 
     impl AddrInfo {}
 
@@ -124,6 +134,13 @@ mod socket {
         fn drop(&mut self) {
             unsafe { ws2tcpip::freeaddrinfo(self.0) };
             println!("Addr Info list was freed");
+        }
+    }
+
+    impl std::ops::Deref for AddrInfo {
+        type Target = ADDRINFOA;
+        fn deref(&self) -> &ADDRINFOA {
+            unsafe { &*self.0 }
         }
     }
 
@@ -163,7 +180,7 @@ mod socket {
             let mut h: ADDRINFOA = unsafe { mem::zeroed() };
             // AI_PASSIVE = The socket address will be used in a call to the
             // bind function.
-            h.ai_flags = AI_PASSIVE;
+            h.ai_flags = ws2def::AI_PASSIVE;
             h.ai_family = socket.address_family;
             h.ai_socktype = socket.r#type;
             h.ai_protocol = socket.protocol;
